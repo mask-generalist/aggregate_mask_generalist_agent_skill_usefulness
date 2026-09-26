@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# CUGA OpenShift Deployment Script
+#
+# Usage:
+#   ./deploy-openshift.sh [path/to/openshift.env] [--with-postgres] [--with-vault]
+#
+# Prerequisites:
+#   - Logged in to OpenShift cluster via `oc login` or `kubectl` with valid kubeconfig
+#   - helm 3 installed
+#   - openshift.env filled in (copy from openshift.env template)
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WITH_POSTGRES=false
+WITH_VAULT=false
+AIRGAPPED=false
+ENV_FILE=""
+for arg in "$@"; do
+  if [[ "$arg" == "--with-postgres" ]]; then
+    WITH_POSTGRES=true
+  elif [[ "$arg" == "--with-vault" ]]; then
+    WITH_VAULT=true
+  elif [[ "$arg" == "--airgapped" ]]; then
+    AIRGAPPED=true
+  else
+    [[ -z "$ENV_FILE" ]] && ENV_FILE="$arg"
+  fi
+done
+ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/openshift.env}"
+
+# ---------------------------------------------------------------------------
+# Load environment
+# ---------------------------------------------------------------------------
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "ERROR: env file not found: $ENV_FILE"
+  echo "Usage: $0 [path/to/openshift.env]"
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+set -a
+source "$ENV_FILE"
+set +a
+
+# ---------------------------------------------------------------------------
+# Validate required variables
+# ---------------------------------------------------------------------------
+
+REQUIRED_VARS=(
+  INSTANCE_ID
+  NAMESPACE
+  ICR_API_KEY
+  IMAGE_REPOSITORY
+  IMAGE_TAG
+  GROQ_API_KEY
+  MODEL_NAME
+  AGENT_SETTING_CONFIG
+)
+
+if [[ "$WITH_POSTGRES" == true ]]; then
+  REQUIRED_VARS+=(POSTGRES_PASSWORD)
+fi
+
+MISSING=()
+for var in "${REQUIRED_VARS[@]}"; do
+  if [[ -z "${!var:-}" ]]; then
+    MISSING+=("$var")
+  fi
+done
+
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  echo "ERROR: The following required variables are not set in $ENV_FILE:"
+  for v in "${MISSING[@]}"; do
+    echo "  - $v"
+  done
+  exit 1
+fi
+
+# Derived names — all scoped to INSTANCE_ID so multiple instances coexist
+RELEASE_NAME="cuga-${INSTANCE_ID}"
+PULL_SECRET_NAME="${INSTANCE_ID}-icr-pull-secret"
+ENV_SECRET_NAME="${INSTANCE_ID}-env-secret"
+CHART_PATH="${SCRIPT_DIR}/cuga"
+KUBECTL_TIMEOUT="${KUBECTL_REQUEST_TIMEOUT:-120}"
+HELM_TIMEOUT="${HELM_TIMEOUT:-10m}"
+TOTAL_STEPS=6
+[[ "$WITH_POSTGRES" != true ]] && TOTAL_STEPS=5
+[[ "$WITH_VAULT" == true ]] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+
+echo ""
+echo "========================================"
+echo "  CUGA OpenShift Deployment"
+echo "  Instance  : ${INSTANCE_ID}"
+echo "  Release   : ${RELEASE_NAME}"
+echo "  Namespace : ${NAMESPACE}"
+echo "  Hostname  : ${ROUTE_HOSTNAME:-<auto-assigned by OpenShift>}"
+if [[ "$WITH_POSTGRES" == true ]]; then
+  echo "  Postgres  : enabled (shared per namespace)"
+  if [[ -n "${DOCKERHUB_USERNAME:-}" ]] && [[ -n "${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD:-}}" ]]; then
+    echo "  PG image  : Docker Hub pull secret (authenticated)"
+  elif [[ -n "${POSTGRES_IMAGE_PULL_SECRET:-}" ]]; then
+    echo "  PG image  : imagePullSecret ${POSTGRES_IMAGE_PULL_SECRET}"
+  fi
+fi
+if [[ "$WITH_VAULT" == true ]]; then
+  echo "  Vault     : enabled"
+fi
+if [[ "$AIRGAPPED" == true ]]; then
+  echo "  Airgapped : enabled (NetworkPolicy blocking egress applied)"
+fi
+echo "========================================"
+echo ""
+
+# ---------------------------------------------------------------------------
+# 1. Create namespace (idempotent)
+# ---------------------------------------------------------------------------
+
+STEP=1
+echo "[${STEP}/${TOTAL_STEPS}] Creating namespace: ${NAMESPACE}"
+kubectl create namespace "${NAMESPACE}" \
+  --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
+((STEP++))
+
+# ---------------------------------------------------------------------------
+# 2. Postgres secret + Helm (when --with-postgres)
+# ---------------------------------------------------------------------------
+
+if [[ "$WITH_POSTGRES" == true ]]; then
+  echo "[${STEP}/${TOTAL_STEPS}] Creating postgres secret (postgres-secret)"
+  kubectl create secret generic postgres-secret \
+    --from-literal=password="${POSTGRES_PASSWORD}" \
+    --namespace="${NAMESPACE}" \
+    --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
+  ((STEP++))
+
+  POSTGRES_PGVECTOR_HELM_EXTRA=()
+  if [[ -n "${DOCKERHUB_USERNAME:-}" ]] && [[ -n "${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD:-}}" ]]; then
+    PG_DOCKERHUB_SECRET="${POSTGRES_IMAGE_PULL_SECRET:-postgres-pgvector-dockerhub-pull}"
+    DH_PASS="${DOCKERHUB_TOKEN:-${DOCKERHUB_PASSWORD}}"
+    echo "  (Docker Hub pull secret for postgres image: ${PG_DOCKERHUB_SECRET})"
+    kubectl create secret docker-registry "${PG_DOCKERHUB_SECRET}" \
+      --docker-server=https://index.docker.io/v1/ \
+      --docker-username="${DOCKERHUB_USERNAME}" \
+      --docker-password="${DH_PASS}" \
+      --namespace="${NAMESPACE}" \
+      --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
+    POSTGRES_PGVECTOR_HELM_EXTRA+=(--set "imagePullSecrets[0].name=${PG_DOCKERHUB_SECRET}")
+  elif [[ -n "${POSTGRES_IMAGE_PULL_SECRET:-}" ]]; then
+    POSTGRES_PGVECTOR_HELM_EXTRA+=(--set "imagePullSecrets[0].name=${POSTGRES_IMAGE_PULL_SECRET}")
+  fi
+
+  echo "[${STEP}/${TOTAL_STEPS}] Deploying postgres (postgres-pgvector)"
+  helm upgrade --install postgres-pgvector "${SCRIPT_DIR}/postgres-pgvector" \
+    --namespace "${NAMESPACE}" \
+    --timeout "${HELM_TIMEOUT}" \
+    --disable-openapi-validation \
+    --set "auth.database=${POSTGRES_DB:-cuga}" \
+    --set "auth.username=${POSTGRES_USER:-cuga}" \
+    --set "auth.existingSecret=postgres-secret" \
+    --set "auth.existingSecretKey=password" \
+    ${POSTGRES_PGVECTOR_HELM_EXTRA[@]+"${POSTGRES_PGVECTOR_HELM_EXTRA[@]}"}
+  ((STEP++))
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Image pull secret for IBM Container Registry
+# ---------------------------------------------------------------------------
+
+echo "[${STEP}/${TOTAL_STEPS}] Creating image pull secret: ${PULL_SECRET_NAME}"
+kubectl create secret docker-registry "${PULL_SECRET_NAME}" \
+  --docker-server=us.icr.io \
+  --docker-username=iamapikey \
+  --docker-password="${ICR_API_KEY}" \
+  --namespace="${NAMESPACE}" \
+  --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
+((STEP++))
+
+# ---------------------------------------------------------------------------
+# 4. Environment secret (sensitive values only)
+# ---------------------------------------------------------------------------
+
+echo "[${STEP}/${TOTAL_STEPS}] Creating env secret: ${ENV_SECRET_NAME}"
+
+# Build --from-literal args for sensitive keys
+SECRET_ARGS=(
+  "--from-literal=GROQ_API_KEY=${GROQ_API_KEY}"
+)
+
+[[ -n "${OIDC_CLIENT_ID:-}" ]]            && SECRET_ARGS+=("--from-literal=OIDC_CLIENT_ID=${OIDC_CLIENT_ID}")
+[[ -n "${OIDC_CLIENT_SECRET:-}" ]]        && SECRET_ARGS+=("--from-literal=OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}")
+[[ -n "${OIDC_DISCOVERY_URL:-}" ]]        && SECRET_ARGS+=("--from-literal=OIDC_DISCOVERY_URL=${OIDC_DISCOVERY_URL}")
+[[ -n "${OIDC_REDIRECT_URI:-}" ]]         && SECRET_ARGS+=("--from-literal=OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI}")
+[[ -n "${VAULT_TOKEN:-}" ]]               && SECRET_ARGS+=("--from-literal=VAULT_TOKEN=${VAULT_TOKEN}")
+[[ -n "${CUGA_SECRET_KEY:-}" ]]           && SECRET_ARGS+=("--from-literal=CUGA_SECRET_KEY=${CUGA_SECRET_KEY}")
+
+if [[ "$WITH_POSTGRES" == true ]]; then
+  PG_URL="postgresql://${POSTGRES_USER:-cuga}:${POSTGRES_PASSWORD}@postgres-pgvector.${NAMESPACE}.svc.cluster.local:5432/${POSTGRES_DB:-cuga}"
+  SECRET_ARGS+=("--from-literal=DYNACONF_STORAGE__POSTGRES_URL=${PG_URL}")
+else
+  if [[ -n "${DYNACONF_STORAGE__POSTGRES_URL:-}" ]]; then
+    SECRET_ARGS+=("--from-literal=DYNACONF_STORAGE__POSTGRES_URL=${DYNACONF_STORAGE__POSTGRES_URL}")
+  elif [[ -n "${POSTGRES_PASSWORD:-}" ]]; then
+    PG_URL="postgresql://${POSTGRES_USER:-cuga}:${POSTGRES_PASSWORD}@postgres-pgvector.${NAMESPACE}.svc.cluster.local:5432/${POSTGRES_DB:-cuga}"
+    SECRET_ARGS+=("--from-literal=DYNACONF_STORAGE__POSTGRES_URL=${PG_URL}")
+  else
+    PG_PASS=$(kubectl get secret postgres-secret --namespace="${NAMESPACE}" --request-timeout="${KUBECTL_TIMEOUT}" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    if [[ -n "${PG_PASS}" ]]; then
+      PG_URL="postgresql://${POSTGRES_USER:-cuga}:${PG_PASS}@postgres-pgvector.${NAMESPACE}.svc.cluster.local:5432/${POSTGRES_DB:-cuga}"
+      SECRET_ARGS+=("--from-literal=DYNACONF_STORAGE__POSTGRES_URL=${PG_URL}")
+    fi
+  fi
+fi
+
+kubectl create secret generic "${ENV_SECRET_NAME}" \
+  "${SECRET_ARGS[@]}" \
+  --namespace="${NAMESPACE}" \
+  --dry-run=client -o yaml | kubectl apply -f - --request-timeout="${KUBECTL_TIMEOUT}"
+((STEP++))
+
+# ---------------------------------------------------------------------------
+# Optional: Vault deployment
+# ---------------------------------------------------------------------------
+
+if [[ "$WITH_VAULT" == true ]]; then
+  echo "[${STEP}/${TOTAL_STEPS}] Deploying HashiCorp Vault"
+  VAULT_CHART_PATH="${SCRIPT_DIR}/vault"
+
+  helm repo add hashicorp https://helm.releases.hashicorp.com 2>/dev/null || true
+  helm repo update hashicorp 2>/dev/null || true
+  helm dependency update "${VAULT_CHART_PATH}" 2>/dev/null || true
+
+  helm upgrade --install vault "${VAULT_CHART_PATH}" \
+    --namespace "${NAMESPACE}" \
+    --timeout "${HELM_TIMEOUT}" \
+    --disable-openapi-validation \
+    -f "${VAULT_CHART_PATH}/values.openshift.yaml" \
+    ${VAULT_TOKEN:+--set "vault.server.extraEnvironmentVars.VAULT_DEV_ROOT_TOKEN_ID=${VAULT_TOKEN}"}
+  ((STEP++))
+
+  echo ""
+  echo "  Vault deployed. Initialize it (first time only):"
+  echo "    kubectl exec -n ${NAMESPACE} -it vault-0 -- vault operator init"
+  echo ""
+  echo "  Add to your env file:"
+  echo "    VAULT_TOKEN=<root-token>"
+  echo "    DYNACONF_SECRETS__MODE=vault"
+  echo "    DYNACONF_SECRETS__VAULT_ADDR=http://vault.${NAMESPACE}.svc.cluster.local:8200"
+  echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Helm deploy (cuga)
+# ---------------------------------------------------------------------------
+
+if [[ "$AIRGAPPED" == true ]]; then
+  echo "[${STEP}/${TOTAL_STEPS}] Applying Airgap NetworkPolicy (deny egress)"
+  # Policy logic:
+  # 1. Deny all egress by default (achieved by policyTypes: [Egress] with no catch-all allow)
+  # 2. Allow egress to local namespace (for postgres, internal services)
+  # 3. Allow DNS (UDP/TCP 53)
+  # 4. Allow Groq IPs if resolved
+  
+  cat <<EOF | kubectl apply -n "${NAMESPACE}" -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: "${INSTANCE_ID}-airgap-egress"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: "${RELEASE_NAME}"
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: "${NAMESPACE}"
+  - ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+EOF
+fi
+
+echo "[${STEP}/${TOTAL_STEPS}] Deploying Helm release: ${RELEASE_NAME}"
+
+STORAGE_MODE="${DYNACONF_STORAGE__MODE:-local}"
+[[ "$WITH_POSTGRES" == true ]] && STORAGE_MODE=prod
+
+HELM_ARGS=(
+  upgrade --install "${RELEASE_NAME}" "${CHART_PATH}"
+  --namespace "${NAMESPACE}"
+  --set "image.repository=${IMAGE_REPOSITORY}"
+  --set "image.tag=${IMAGE_TAG}"
+  --set "image.pullPolicy=Always"
+  --set "imagePullSecrets[0].name=${PULL_SECRET_NAME}"
+  --set "existingSecret=${ENV_SECRET_NAME}"
+  --set "env.DYNACONF_SERVICE__INSTANCE_ID=${DYNACONF_SERVICE__INSTANCE_ID:-${INSTANCE_ID}}"
+  --set "env.DYNACONF_SERVICE__TENANT_ID=${DYNACONF_SERVICE__TENANT_ID:-${NAMESPACE}}"
+  --set "env.UV_CACHE_DIR=${UV_CACHE_DIR:-/tmp/uv-cache}"
+  --set "env.MODEL_NAME=${MODEL_NAME}"
+  --set "env.AGENT_SETTING_CONFIG=${AGENT_SETTING_CONFIG}"
+  --set "env.DYNACONF_AUTH__ENABLED=${DYNACONF_AUTH__ENABLED:-true}"
+  --set "env.DYNACONF_AUTH__REQUIRE_HTTPS=${DYNACONF_AUTH__REQUIRE_HTTPS:-false}"
+  --set "env.DYNACONF_AUTH__AUTHORIZATION_ENABLED=${DYNACONF_AUTH__AUTHORIZATION_ENABLED:-false}"
+  --set "env.DYNACONF_AUTH__OIDC_SKIP_VERIFY=${DYNACONF_AUTH__OIDC_SKIP_VERIFY:-false}"
+  --set "env.DYNACONF_AUTH__OIDC_CA_BUNDLE=${DYNACONF_AUTH__OIDC_CA_BUNDLE:-}"
+  --set "env.DYNACONF_AUTH__ROLE_TOKEN_SOURCE=${DYNACONF_AUTH__ROLE_TOKEN_SOURCE:-auto}"
+  --set "env.DYNACONF_STORAGE__MODE=${STORAGE_MODE}"
+  --set "env.DYNACONF_SECRETS__FORCE_ENV=${DYNACONF_SECRETS__FORCE_ENV:-false}"
+  --set "env.DYNACONF_SECRETS__VAULT_SKIP_VERIFY=${DYNACONF_SECRETS__VAULT_SKIP_VERIFY:-false}"
+  --set "env.DYNACONF_UI__HIDE_CUGA_LOGO=${DYNACONF_UI__HIDE_CUGA_LOGO:-false}"
+  --set "env.DYNACONF_UI__BRAND_NAME=${DYNACONF_UI__BRAND_NAME:-}"
+  --set "env.CUGA_DEMO_MODE=${CUGA_DEMO_MODE:-default}"
+  --set "env.DYNACONF_OBSERVABILITY__OPENLIT=${DYNACONF_OBSERVABILITY__OPENLIT:-false}"
+  --set "env.OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+  --set "route.enabled=true"
+)
+
+if [[ "$WITH_VAULT" == true ]]; then
+  VAULT_INTERNAL_ADDR="http://vault.${NAMESPACE}.svc.cluster.local:8200"
+  HELM_ARGS+=(
+    "--set" "env.DYNACONF_SECRETS__MODE=vault"
+    "--set" "env.DYNACONF_SECRETS__VAULT_ADDR=${VAULT_ADDR:-${VAULT_INTERNAL_ADDR}}"
+    "--set" "env.DYNACONF_SECRETS__VAULT_TOKEN_ENV=VAULT_TOKEN"
+  )
+fi
+
+if [[ -n "${DYNACONF_SECRETS__MODE:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__MODE=${DYNACONF_SECRETS__MODE}")
+fi
+
+if [[ -n "${DYNACONF_SECRETS__VAULT_ADDR:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_ADDR=${DYNACONF_SECRETS__VAULT_ADDR}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_TOKEN_ENV:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_TOKEN_ENV=${DYNACONF_SECRETS__VAULT_TOKEN_ENV}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_MOUNT:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_MOUNT=${DYNACONF_SECRETS__VAULT_MOUNT}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_KV_VERSION:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_KV_VERSION=${DYNACONF_SECRETS__VAULT_KV_VERSION}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_AUTH_METHOD:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_AUTH_METHOD=${DYNACONF_SECRETS__VAULT_AUTH_METHOD}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_K8S_ROLE:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_K8S_ROLE=${DYNACONF_SECRETS__VAULT_K8S_ROLE}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_K8S_MOUNT_PATH:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_K8S_MOUNT_PATH=${DYNACONF_SECRETS__VAULT_K8S_MOUNT_PATH}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_K8S_JWT_PATH:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_K8S_JWT_PATH=${DYNACONF_SECRETS__VAULT_K8S_JWT_PATH}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_SECRET_PATH:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_SECRET_PATH=${DYNACONF_SECRETS__VAULT_SECRET_PATH}")
+fi
+if [[ -n "${DYNACONF_SECRETS__VAULT_CACERT:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_CACERT=${DYNACONF_SECRETS__VAULT_CACERT}")
+fi
+if [[ -n "${VAULT_CACERT:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_CACERT=${VAULT_CACERT}")
+fi
+if [[ -n "${VAULT_SKIP_VERIFY:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_SECRETS__VAULT_SKIP_VERIFY=${VAULT_SKIP_VERIFY}")
+fi
+
+if [[ -n "${VAULT_TOKEN:-}" ]]; then
+  HELM_ARGS+=("--set" "env.VAULT_TOKEN=_")
+fi
+
+if [[ -n "${DYNACONF_AUTH__IAM_PROXY_URL:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_AUTH__IAM_PROXY_URL=${DYNACONF_AUTH__IAM_PROXY_URL}")
+fi
+if [[ -n "${DYNACONF_AUTH__IAM_PROXY_SKIP_VERIFY:-}" ]]; then
+  HELM_ARGS+=("--set" "env.DYNACONF_AUTH__IAM_PROXY_SKIP_VERIFY=${DYNACONF_AUTH__IAM_PROXY_SKIP_VERIFY}")
+fi
+
+if [[ -n "${ROUTE_HOSTNAME:-}" ]]; then
+  HELM_ARGS+=("--set" "route.hostname=${ROUTE_HOSTNAME}")
+fi
+
+HELM_ARGS+=("--timeout" "${HELM_TIMEOUT}")
+HELM_ARGS+=("--disable-openapi-validation")
+
+helm "${HELM_ARGS[@]}"
+
+# ---------------------------------------------------------------------------
+# 6. Print access URLs
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "[${STEP}/${TOTAL_STEPS}] Deployment complete. Fetching route..."
+
+# Give the route a moment to be assigned a host if no hostname was specified
+sleep 2
+
+ASSIGNED_HOST=$(kubectl get route "${RELEASE_NAME}" \
+  --namespace="${NAMESPACE}" \
+  --request-timeout="${KUBECTL_TIMEOUT}" \
+  -o jsonpath='{.spec.host}' 2>/dev/null || true)
+
+echo ""
+echo "========================================"
+echo "  Access URLs (HTTPS)"
+if [[ -n "${ASSIGNED_HOST}" ]]; then
+  echo "  App     : https://${ASSIGNED_HOST}/"
+  echo "  Chat    : https://${ASSIGNED_HOST}/chat"
+  echo "  Manage  : https://${ASSIGNED_HOST}/manage"
+else
+  echo "  Route not yet ready. Check with:"
+  echo "  kubectl get route ${RELEASE_NAME} -n ${NAMESPACE}"
+fi
+echo "========================================"
+echo ""

@@ -1,0 +1,1791 @@
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import * as api from "./api";
+import { ConfigHeader } from "./ConfigHeader";
+import CarbonChat, { generateUUID } from "./carbon-chat/CarbonChat";
+import {
+  IconButton,
+  Tag,
+  TreeView,
+  TreeNode,
+  ComposedModal,
+  ModalHeader,
+  ModalBody,
+  ModalFooter,
+  SkeletonText,
+  ToastNotification,
+  Button,
+  Accordion,
+  AccordionItem,
+  ContainedList,
+  ContainedListItem,
+  Tile,
+  Layer,
+  Stack,
+} from "@carbon/react";
+import Markdown from "@carbon/ai-chat-components/es/react/markdown.js";
+import {
+  Add,
+  TrashCan,
+  Folder,
+  FolderOpen,
+  Settings,
+  Application,
+  ChevronRight,
+  DocumentBlank,
+  Chat,
+  Time,
+  SidePanelOpen,
+  SidePanelClose,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  Upload,
+  Renew,
+} from "@carbon/icons-react";
+import { KnowledgeSidePanel } from "agentic_chat/KnowledgeSidePanel";
+import type { SessionAttachmentSnapshot } from "./knowledge/useSessionKnowledgeAttachments";
+import "./ChatLanding.css";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ConversationThread {
+  thread_id: string;
+  latest_version: number;
+  first_message: string;
+  updated_at: string;
+}
+
+interface AppTool {
+  name: string;
+  description: string;
+}
+
+interface AppConfig {
+  appName: string;
+  tools: AppTool[];
+}
+
+interface WorkspaceChild {
+  label: string;
+  type: "folder" | "file";
+}
+
+interface WorkspaceFolder {
+  path: string;
+  label: string;
+  readOnly: boolean;
+  children?: WorkspaceChild[];
+}
+
+interface FileNode {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  children?: FileNode[];
+}
+
+function collectDirectoryPaths(nodes: FileNode[]): Set<string> {
+  const out = new Set<string>();
+  const walk = (list: FileNode[]) => {
+    for (const n of list) {
+      if (n.type === "directory") {
+        out.add(n.path);
+        if (n.children?.length) walk(n.children);
+      }
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
+interface AgentConfig {
+  name: string;
+  description: string;
+  configVersion?: number | string | null;
+  apps: AppConfig[];
+  workspaceFolders: WorkspaceFolder[];
+}
+
+interface HomescreenConfig {
+  isOn?: boolean;
+  greeting?: string;
+  starters?: string[];
+}
+
+type RightPanelSection = "configuration" | "workspace" | "knowledge" | "skills";
+
+interface SkillInfo {
+  name: string;
+  description: string;
+  requirements: string[];
+  source: string;
+}
+
+interface DraftThreadState {
+  threadId: string;
+  hasSentFirstMessage: boolean;
+  updatedAt: string;
+}
+
+interface KnowledgePreviewModalState {
+  attachment: SessionAttachmentSnapshot;
+  content?: string;
+  downloadUrl: string;
+  isPdf: boolean;
+}
+
+const RIGHT_PANEL_META: Record<
+  RightPanelSection,
+  { title: string; subtitle: string; icon: React.ElementType; badgeClass: string; ariaLabel: string }
+> = {
+  configuration: {
+    title: "Configuration",
+    subtitle: "Apps and tools available to this agent",
+    icon: Settings,
+    badgeClass: "agent-section-badge--configuration",
+    ariaLabel: "Configuration section",
+  },
+  workspace: {
+    title: "Workspace",
+    subtitle: "Files available in the current workspace",
+    icon: Folder,
+    badgeClass: "agent-section-badge--workspace",
+    ariaLabel: "Workspace section",
+  },
+  knowledge: {
+    title: "Knowledge",
+    subtitle: "Agent and conversation documents for retrieval",
+    icon: DocumentBlank,
+    badgeClass: "agent-section-badge--knowledge",
+    ariaLabel: "Knowledge section",
+  },
+  skills: {
+    title: "Skills",
+    subtitle: "Installed automation workflows",
+    icon: Application,
+    badgeClass: "agent-section-badge--skills",
+    ariaLabel: "Skills section",
+  },
+};
+
+// ─── Mock data ────────────────────────────────────────────────────────────────
+
+const MOCK_AGENT_CONFIG: AgentConfig = {
+  name: "CUGA Default Agent",
+  description: "A general-purpose assistant with file-system access and web search capabilities.",
+  apps: [
+    {
+      appName: "File System",
+      tools: [
+        { name: "read_file", description: "Read contents of a file" },
+        { name: "write_file", description: "Write or update a file" },
+        { name: "list_directory", description: "List files in a directory" },
+        { name: "delete_file", description: "Delete a file permanently" },
+      ],
+    },
+    {
+      appName: "Web Search",
+      tools: [
+        { name: "web_search", description: "Search the web for information" },
+        { name: "fetch_url", description: "Fetch and parse a web page" },
+      ],
+    },
+    {
+      appName: "Code Execution",
+      tools: [
+        { name: "run_python", description: "Execute a Python snippet" },
+        { name: "run_bash", description: "Execute a Bash command" },
+      ],
+    },
+  ],
+  workspaceFolders: [
+    {
+      path: "/workspace/project-a",
+      label: "project-a",
+      readOnly: false,
+      children: [
+        { label: "src", type: "folder" },
+        { label: "tests", type: "folder" },
+        { label: "README.md", type: "file" },
+        { label: "package.json", type: "file" },
+      ],
+    },
+    {
+      path: "/workspace/shared-docs",
+      label: "shared-docs",
+      readOnly: true,
+      children: [
+        { label: "specs", type: "folder" },
+        { label: "guidelines.md", type: "file" },
+      ],
+    },
+  ],
+};
+
+// ─── Responsive breakpoints ───────────────────────────────────────────────────
+
+const BP_HIDE_RIGHT = 1100; // px — hide right panel below this
+const BP_HIDE_LEFT = 768; // px — hide left panel below this
+const DRAFT_THREAD_STORAGE_KEY = "cuga-demo-draft-thread";
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const formatTimestamp = (isoString: string): string => {
+  const utcString = isoString.endsWith("Z") ? isoString : `${isoString}Z`;
+  const date = new Date(utcString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffSecs = Math.floor(diffMs / 1000);
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffSecs < 10) return "Just now";
+  if (diffSecs < 60) return `${diffSecs}s ago`;
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+};
+
+const truncateText = (text: string, maxLength: number = 100): string => {
+  if (text.length <= maxLength) return text;
+  return text.substring(0, maxLength) + "...";
+};
+
+const TEXT_EXTENSIONS = [".txt", ".md", ".json", ".yaml", ".yml", ".log", ".csv", ".html", ".css", ".js", ".ts", ".py"];
+const JSON_UPLOAD_SUFFIXES = [".json", ".jsonl", ".ndjson"];
+
+const filterJsonUploadFiles = (files: File[]): File[] =>
+  files.filter((file) => JSON_UPLOAD_SUFFIXES.some((suffix) => file.name.toLowerCase().endsWith(suffix)));
+
+const createDraftThreadState = (): DraftThreadState => ({
+  threadId: generateUUID(),
+  hasSentFirstMessage: false,
+  updatedAt: new Date().toISOString(),
+});
+
+const loadDraftThreadState = (): DraftThreadState | null => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(DRAFT_THREAD_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<DraftThreadState>;
+    if (typeof parsed.threadId !== "string" || !parsed.threadId || parsed.hasSentFirstMessage === true) {
+      window.sessionStorage.removeItem(DRAFT_THREAD_STORAGE_KEY);
+      return null;
+    }
+    return {
+      threadId: parsed.threadId,
+      hasSentFirstMessage: false,
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error("Failed to restore draft thread state:", error);
+    window.sessionStorage.removeItem(DRAFT_THREAD_STORAGE_KEY);
+    return null;
+  }
+};
+
+const persistDraftThreadState = (draftThread: DraftThreadState) => {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.setItem(DRAFT_THREAD_STORAGE_KEY, JSON.stringify(draftThread));
+};
+
+const clearDraftThreadState = () => {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.removeItem(DRAFT_THREAD_STORAGE_KEY);
+};
+
+// ─── Inline style constants ───────────────────────────────────────────────────
+
+// Glass / frosted-transparent panel base — floats over the chat
+const panelStyle = (side: "left" | "right", headerH: number, width: string, visible: boolean): React.CSSProperties => ({
+  position: "fixed",
+  top: headerH,
+  bottom: 0,
+  [side]: 0,
+  width,
+  zIndex: 200,
+  display: "flex",
+  flexDirection: "column",
+  overflow: "hidden",
+  // Transparent glass effect
+  background: "rgba(var(--cds-background-rgb, 255,255,255), 0.55)",
+  backdropFilter: "blur(12px)",
+  WebkitBackdropFilter: "blur(12px)",
+  // IBM Carbon border standards - using subtle border for minimal visibility
+  borderRight: side === "left" ? "1px solid var(--cds-border-subtle-01, rgba(0, 0, 0, 0.1))" : undefined,
+  borderLeft: side === "right" ? "1px solid var(--cds-border-subtle-01, rgba(0, 0, 0, 0.1))" : undefined,
+  boxShadow: side === "left"
+    ? "1px 0 4px rgba(0, 0, 0, 0.05)"
+    : "-1px 0 4px rgba(0, 0, 0, 0.05)",
+  // Slide in/out
+  transform: visible ? "translateX(0)" : side === "left" ? "translateX(-100%)" : "translateX(100%)",
+  transition: "transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
+  pointerEvents: visible ? "auto" : "none",
+});
+
+const panelHeader: React.CSSProperties = {
+  padding: "1.5rem 1rem 1rem",
+  borderBottom: "1px solid var(--cds-border-subtle-01)",
+  flexShrink: 0,
+  background: "transparent",
+};
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+const HEADER_HEIGHT = 48; // Carbon shell header default
+const LEFT_W = "22rem";
+const RIGHT_W = "26rem";
+
+export function ChatLanding() {
+  const [draftThread, setDraftThread] = useState<DraftThreadState>(() => loadDraftThreadState() ?? createDraftThreadState());
+  const [windowW, setWindowW] = useState(window.innerWidth);
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
+  const [threads, setThreads] = useState<ConversationThread[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [activeThreadId, setActiveThreadId] = useState<string>(draftThread.threadId);
+  const [rightSection, setRightSection] = useState<RightPanelSection>("workspace");
+  const [knowledgeDocCount, setKnowledgeDocCount] = useState(0);
+  const [knowledgeEnabled, setKnowledgeEnabled] = useState(false);
+  const [agentKnowledgeEnabled, setAgentKnowledgeEnabled] = useState(false);
+  const [sessionKnowledgeEnabled, setSessionKnowledgeEnabled] = useState(false);
+  // Agent-level citations flag (default on — hides the per-session toggle
+  // only when the operator explicitly disabled citations in Manage).
+  const [citationsEnabled, setCitationsEnabled] = useState(true);
+  const [sessionDocsVersion, setSessionDocsVersion] = useState(0);
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>(MOCK_AGENT_CONFIG);
+  const [homescreenConfig, setHomescreenConfig] = useState<HomescreenConfig | undefined>(undefined);
+  const [configLoading, setConfigLoading] = useState(true);
+  const [toastNotifications, setToastNotifications] = useState<Array<{ id: string; kind: "error" | "info" | "success" | "warning"; title: string; subtitle: string }>>([]);
+  const [workspaceTree, setWorkspaceTree] = useState<FileNode[]>([]);
+  const [workspaceExpandedDirs, setWorkspaceExpandedDirs] = useState<Set<string>>(() => new Set());
+  const workspaceTreeDirPathsPrevRef = useRef<Set<string>>(new Set());
+  const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(true);
+  const [fileModal, setFileModal] = useState<{ path: string; content: string; name: string } | null>(null);
+  const [knowledgePreviewModal, setKnowledgePreviewModal] = useState<KnowledgePreviewModalState | null>(null);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(true);
+  const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
+  const [workspaceDragOver, setWorkspaceDragOver] = useState(false);
+  const workspaceFileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    return () => {
+      if (knowledgePreviewModal?.downloadUrl) {
+        URL.revokeObjectURL(knowledgePreviewModal.downloadUrl);
+      }
+    };
+  }, [knowledgePreviewModal]);
+
+  // ── Responsive: auto-collapse on small screens ──────────────────────────────
+  useEffect(() => {
+    const onResize = () => {
+      const w = window.innerWidth;
+      setWindowW(w);
+      if (w < BP_HIDE_LEFT) setLeftOpen(false);
+      if (w < BP_HIDE_RIGHT) setRightOpen(false);
+      if (w >= BP_HIDE_LEFT && w >= BP_HIDE_RIGHT) {
+        setLeftOpen(true);
+        setRightOpen(true);
+      }
+    };
+    window.addEventListener("resize", onResize);
+    onResize(); // run once on mount
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const canShowLeft = windowW >= BP_HIDE_LEFT;
+  const canShowRight = windowW >= BP_HIDE_RIGHT;
+
+  // Toast notification helpers
+  const addToast = useCallback((kind: "error" | "info" | "success" | "warning", title: string, subtitle: string) => {
+    const id = `toast-${Date.now()}-${Math.random()}`;
+    setToastNotifications((prev) => [...prev, { id, kind, title, subtitle }]);
+    setTimeout(() => {
+      setToastNotifications((prev) => prev.filter((t) => t.id !== id));
+    }, 5000);
+  }, []);
+
+  const removeToast = useCallback((id: string) => {
+    setToastNotifications((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const currentChatThreadId = activeThreadId;
+  /** Same resolver as `threadId` on `CarbonChat` — stream, sandbox workspace, and session knowledge must match. */
+  const effectiveChatThreadId = selectedThreadId ?? currentChatThreadId;
+
+  const refreshKnowledgeDocCount = useCallback(
+    async (threadId: string) => {
+      if (!knowledgeEnabled || (!agentKnowledgeEnabled && !sessionKnowledgeEnabled)) {
+        setKnowledgeDocCount(0);
+        return;
+      }
+      try {
+        const [agentDocsResponse, sessionDocsResponse] = await Promise.all([
+          agentKnowledgeEnabled ? api.listKnowledgeDocuments() : Promise.resolve(null),
+          sessionKnowledgeEnabled ? api.listSessionKnowledgeDocuments(threadId) : Promise.resolve(null),
+        ]);
+
+        const agentDocs = agentDocsResponse && agentDocsResponse.ok
+          ? (((await agentDocsResponse.json()).documents ?? []) as Array<unknown>)
+          : [];
+        const sessionDocs = sessionDocsResponse && sessionDocsResponse.ok
+          ? (((await sessionDocsResponse.json()).documents ?? []) as Array<unknown>)
+          : [];
+
+        setKnowledgeDocCount(agentDocs.length + sessionDocs.length);
+      } catch (error) {
+        console.error("Failed to refresh knowledge doc count:", error);
+      }
+    },
+    [agentKnowledgeEnabled, knowledgeEnabled, sessionKnowledgeEnabled],
+  );
+
+  useEffect(() => {
+    if (!draftThread.hasSentFirstMessage && selectedThreadId == null) {
+      persistDraftThreadState(draftThread);
+      return;
+    }
+    clearDraftThreadState();
+  }, [draftThread, selectedThreadId]);
+
+  useEffect(() => {
+    if (selectedThreadId == null) {
+      setActiveThreadId(draftThread.threadId);
+    }
+  }, [draftThread.threadId, selectedThreadId]);
+
+  useEffect(() => {
+    void refreshKnowledgeDocCount(effectiveChatThreadId);
+  }, [effectiveChatThreadId, refreshKnowledgeDocCount, sessionDocsVersion]);
+
+  const handleSessionDocsChanged = useCallback(() => {
+    setSessionDocsVersion((version) => version + 1);
+  }, []);
+
+  const createAndActivateDraftThread = useCallback(() => {
+    const nextDraft = createDraftThreadState();
+    setDraftThread(nextDraft);
+    setSelectedThreadId(null);
+    setActiveThreadId(nextDraft.threadId);
+    setSessionDocsVersion((version) => version + 1);
+    return nextDraft;
+  }, []);
+
+  const clearDraftSessionFiles = useCallback(
+    async (threadId: string) => {
+      try {
+        const res = await api.deleteSessionKnowledgeCollection(threadId);
+        if (!res.ok) {
+          console.error(`Failed to delete session knowledge collection for draft ${threadId}:`, res.statusText);
+          addToast("warning", "Draft cleanup incomplete", "The draft knowledge collection could not be removed.");
+        }
+      } catch (error) {
+        console.error("Failed to clear draft session knowledge collection:", error);
+        addToast("warning", "Draft cleanup incomplete", "The draft knowledge collection could not be removed.");
+      }
+    },
+    [addToast],
+  );
+
+  // ── Thread helpers ──────────────────────────────────────────────────────────
+  const refreshThreads = useCallback(async () => {
+    try {
+      const res = await api.getConversationThreads();
+      if (res.ok) setThreads((await res.json()).threads || []);
+    } catch (err) {
+      console.error("Error fetching threads:", err);
+    }
+  }, []);
+
+  const handleThreadChange = useCallback(
+    async (threadId: string) => {
+      setActiveThreadId(threadId);
+      if (!draftThread.hasSentFirstMessage && threadId === draftThread.threadId) {
+        setDraftThread((prev) => ({
+          ...prev,
+          hasSentFirstMessage: true,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      if (threadId !== selectedThreadId) {
+        setSelectedThreadId(threadId);
+        setTimeout(refreshThreads, 500);
+      }
+    },
+    [draftThread.hasSentFirstMessage, draftThread.threadId, selectedThreadId, refreshThreads],
+  );
+
+  const handleSelectThread = useCallback((threadId: string) => {
+    setSelectedThreadId(threadId);
+  }, []);
+
+  const handleRemoveAll = async () => {
+    if (!window.confirm("Remove all conversations? This cannot be undone.")) return;
+    try {
+      if (!draftThread.hasSentFirstMessage) {
+        await clearDraftSessionFiles(draftThread.threadId);
+      }
+      await Promise.all(
+        threads.map((t) => api.deleteConversation(t.thread_id)),
+      );
+      setThreads([]);
+      createAndActivateDraftThread();
+    } catch (err) {
+      console.error(err);
+      alert("Failed to remove conversations.");
+    }
+  };
+
+  // Fetch agent configuration
+  useEffect(() => {
+    (async () => {
+      try {
+        const agentId = "cuga-default";
+        const isDraft = false; // Use published config for chat landing
+        
+        const [contextRes, toolsListRes, manageRes] = await Promise.all([
+          api.getAgentContext(),
+          api.getToolsList(isDraft),
+          api.getManageConfig(),
+        ]);
+
+        let agentName = "CUGA Default Agent";
+        let agentDescription = "A general-purpose assistant with configured tools and workspace access.";
+        let configVersion: number | string | null = null;
+        let agentIdFallback = "cuga-default";
+
+        if (contextRes.ok) {
+          const contextData = await contextRes.json();
+          agentIdFallback = contextData.agent_id ?? agentIdFallback;
+          configVersion = contextData.config_version ?? null;
+          const kEnabled = contextData.knowledge_enabled ?? false;
+          const agentKEnabled = contextData.agent_level_knowledge_enabled ?? false;
+          const sessionKEnabled = contextData.session_level_knowledge_enabled ?? false;
+          setKnowledgeEnabled(kEnabled);
+          setAgentKnowledgeEnabled(agentKEnabled);
+          setSessionKnowledgeEnabled(sessionKEnabled);
+          setCitationsEnabled(contextData.citations_enabled ?? true);
+          api.setKnowledgeAgentId(agentIdFallback);
+
+          // Eagerly fetch doc count so it's available on first render.
+          if (kEnabled && agentKEnabled) {
+            try {
+              const docsRes = await api.listKnowledgeDocuments();
+              if (docsRes.ok) {
+                const docsData = await docsRes.json();
+                setKnowledgeDocCount((docsData.documents ?? []).length);
+              }
+            } catch { /* will be retried by refreshKnowledgeDocCount effect */ }
+          }
+        }
+
+        let manageData: { config?: { agent?: { name?: string; description?: string }; homescreen?: { isOn?: boolean; greeting?: string; starters?: string[] } } } | null = null;
+        if (manageRes.ok) {
+          manageData = await manageRes.json();
+          const ag = manageData?.config?.agent;
+          if (ag && typeof ag === "object") {
+            if (ag.name && String(ag.name).trim()) {
+              agentName = String(ag.name).trim();
+            }
+            if (ag.description != null && String(ag.description).trim()) {
+              agentDescription = String(ag.description).trim();
+            }
+          }
+          const hs = manageData?.config?.homescreen;
+          if (hs && typeof hs === "object") {
+            setHomescreenConfig({
+              isOn: hs.isOn ?? true,
+              greeting: hs.greeting,
+              starters: Array.isArray(hs.starters) ? hs.starters.slice(0, 4) : undefined,
+            });
+          }
+        }
+
+        // Get tools from tools/list endpoint and group by app
+        let apps: AppConfig[] = MOCK_AGENT_CONFIG.apps;
+        if (toolsListRes.ok) {
+          const toolsData = await toolsListRes.json();
+          const tools = toolsData.tools || [];
+          
+          if (tools.length > 0) {
+            // Group tools by their app field
+            const toolsByApp = new Map<string, AppTool[]>();
+            
+            tools.forEach((tool: any) => {
+              const appName = tool.app || "Unknown App";
+              if (!toolsByApp.has(appName)) {
+                toolsByApp.set(appName, []);
+              }
+              toolsByApp.get(appName)!.push({
+                name: tool.name,
+                description: tool.description || "No description available",
+              });
+            });
+            
+            // Convert map to apps array
+            apps = [];
+            toolsByApp.forEach((tools, appName) => {
+              apps.push({
+                appName,
+                tools,
+              });
+            });
+          }
+        } else {
+          const errorMsg = `Failed to load tools list (${toolsListRes.status} ${toolsListRes.statusText})`;
+          addToast("warning", "Tools Load Warning", errorMsg);
+        }
+
+        if (manageRes.ok && manageData) {
+          const hs = manageData.config?.homescreen;
+          const knowledgeConfig = (manageData as any).config?.knowledge;
+          if (hs && typeof hs === "object") {
+            setHomescreenConfig({
+              isOn: hs.isOn ?? true,
+              greeting: hs.greeting,
+              starters: Array.isArray(hs.starters) ? hs.starters.slice(0, 4) : undefined,
+            });
+          }
+          if (knowledgeConfig && typeof knowledgeConfig === "object") {
+            setKnowledgeEnabled(knowledgeConfig.enabled ?? false);
+            setAgentKnowledgeEnabled(knowledgeConfig.agent_level_enabled ?? false);
+            setSessionKnowledgeEnabled(knowledgeConfig.session_level_enabled ?? false);
+            setCitationsEnabled(knowledgeConfig.citations_enabled ?? true);
+          }
+        }
+
+        const config: AgentConfig = {
+          name: agentName,
+          description: agentDescription,
+          configVersion,
+          apps,
+          workspaceFolders: MOCK_AGENT_CONFIG.workspaceFolders, // TODO: Get from API if available
+        };
+        
+        setAgentConfig(config);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : "Network error loading agent configuration";
+        addToast("error", "Configuration Load Error", errorMsg);
+        console.error("Error fetching agent config:", err);
+        // Keep using MOCK_AGENT_CONFIG as fallback
+      } finally {
+        setConfigLoading(false);
+      }
+    })();
+  }, [addToast]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await api.getConversationThreads();
+        if (!res.ok) {
+          const errorMsg = `Failed to load conversation threads (${res.status} ${res.statusText})`;
+          addToast("warning", "Threads Load Warning", errorMsg);
+          console.error(errorMsg);
+        } else {
+          setThreads((await res.json()).threads || []);
+        }
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : "Network error loading conversation threads";
+        addToast("error", "Threads Load Error", errorMsg);
+        console.error(err);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [addToast]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await api.getSkills();
+        if (!res.ok) {
+          console.error(`Failed to load skills (${res.status} ${res.statusText})`);
+        } else {
+          const data = await res.json();
+          setSkills(data.skills || []);
+        }
+      } catch (err) {
+        console.error("Failed to load skills:", err);
+      } finally {
+        setSkillsLoading(false);
+      }
+    })();
+  }, []);
+
+  const fetchWorkspaceTree = useCallback(async (forceRefresh = false) => {
+    try {
+      if (forceRefresh) setWorkspaceTreeLoading(true);
+      const res = await api.getWorkspaceTree(effectiveChatThreadId || undefined, forceRefresh);
+      if (res.ok) {
+        const data = await res.json();
+        setWorkspaceTree(data.tree || []);
+      } else if (forceRefresh) {
+        addToast("warning", "Workspace refresh failed", `${res.status} ${res.statusText}`);
+      }
+    } catch (err) {
+      console.error("Error fetching workspace tree:", err);
+      if (forceRefresh) {
+        addToast("error", "Workspace refresh failed", err instanceof Error ? err.message : "Unknown error");
+      }
+    } finally {
+      setWorkspaceTreeLoading(false);
+    }
+  }, [addToast, effectiveChatThreadId]);
+
+  useEffect(() => {
+    fetchWorkspaceTree();
+    const interval = setInterval(fetchWorkspaceTree, 2500);
+    return () => clearInterval(interval);
+  }, [fetchWorkspaceTree]);
+
+  useEffect(() => {
+    workspaceTreeDirPathsPrevRef.current = new Set();
+    setWorkspaceExpandedDirs(new Set());
+    setWorkspaceTree([]);
+    setWorkspaceTreeLoading(true);
+  }, [effectiveChatThreadId]);
+
+  useEffect(() => {
+    const valid = collectDirectoryPaths(workspaceTree);
+    const prevValid = workspaceTreeDirPathsPrevRef.current;
+    setWorkspaceExpandedDirs((expanded) => {
+      const next = new Set<string>();
+      for (const p of expanded) {
+        if (valid.has(p)) next.add(p);
+      }
+      for (const p of valid) {
+        if (!prevValid.has(p)) next.add(p);
+      }
+      return next;
+    });
+    workspaceTreeDirPathsPrevRef.current = valid;
+  }, [workspaceTree]);
+
+  const handleWorkspaceDirToggle = useCallback((path: string, ...args: unknown[]) => {
+    const first = args[0];
+    const second = args[1];
+    let nextExpanded: boolean | undefined;
+    if (typeof first === "boolean") {
+      nextExpanded = first;
+    } else if (second && typeof second === "object" && second !== null && "isExpanded" in second) {
+      nextExpanded = Boolean((second as { isExpanded?: boolean }).isExpanded);
+    }
+    if (typeof nextExpanded !== "boolean") return;
+    setWorkspaceExpandedDirs((prev) => {
+      const next = new Set(prev);
+      if (nextExpanded) next.add(path);
+      else next.delete(path);
+      return next;
+    });
+  }, []);
+
+  const totalTools = agentConfig.apps.reduce((s, a) => s + a.tools.length, 0);
+
+  const handleFileClick = useCallback(async (node: FileNode) => {
+    if (node.type !== "file") return;
+    const isTextFile = TEXT_EXTENSIONS.some((ext) => node.name.toLowerCase().endsWith(ext));
+    if (!isTextFile) {
+      addToast("info", "Preview not available", "Only text and markdown files can be previewed.");
+      return;
+    }
+    try {
+      const res = await api.getWorkspaceFile(node.path, effectiveChatThreadId || undefined);
+      if (res.ok) {
+        const data = await res.json();
+        setFileModal({ path: node.path, content: data.content, name: node.name });
+      } else {
+        addToast("error", "Failed to load file", res.statusText);
+      }
+    } catch (err) {
+      addToast("error", "Error loading file", err instanceof Error ? err.message : "Unknown error");
+    }
+  }, [addToast, effectiveChatThreadId]);
+
+  const handleWorkspaceFileDownload = useCallback(
+    async (node: FileNode) => {
+      if (node.type !== "file") return;
+      try {
+        const res = await api.getWorkspaceDownload(node.path, effectiveChatThreadId || undefined);
+        if (!res.ok) {
+          addToast("error", "Download failed", res.statusText || `HTTP ${res.status}`);
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = node.name;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        addToast("error", "Download failed", err instanceof Error ? err.message : "Unknown error");
+      }
+    },
+    [addToast, effectiveChatThreadId],
+  );
+
+  const handleWorkspaceUpload = useCallback(
+    async (files: File[]) => {
+      const tid = effectiveChatThreadId?.trim();
+      if (!tid) {
+        addToast("warning", "Upload unavailable", "Start a chat before uploading files.");
+        return;
+      }
+      try {
+        await Promise.all(
+          files.map(async (file) => {
+            const res = await api.uploadWorkspaceFile(file, tid);
+            if (!res.ok) {
+              let detail = res.statusText;
+              try {
+                const body = await res.json();
+                detail = body.detail || detail;
+              } catch {
+                // ignore
+              }
+              throw new Error(`${file.name}: ${detail}`);
+            }
+          }),
+        );
+        addToast("success", "Upload complete", `${files.length} file${files.length !== 1 ? "s" : ""} uploaded to workspace/uploads/`);
+        await fetchWorkspaceTree();
+      } catch (err) {
+        addToast("error", "Upload failed", err instanceof Error ? err.message : "Unknown error");
+      }
+    },
+    [addToast, effectiveChatThreadId, fetchWorkspaceTree],
+  );
+
+  const handleWorkspaceFileInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files ? Array.from(e.target.files) : [];
+      if (files.length > 0) {
+        void handleWorkspaceUpload(files);
+      }
+      e.target.value = "";
+    },
+    [handleWorkspaceUpload],
+  );
+
+  const closeKnowledgePreviewModal = useCallback(() => {
+    setKnowledgePreviewModal((current) => {
+      if (current?.downloadUrl) {
+        URL.revokeObjectURL(current.downloadUrl);
+      }
+      return null;
+    });
+  }, []);
+
+  const handlePreviewKnowledgeAttachment = useCallback(async (attachment: SessionAttachmentSnapshot) => {
+    try {
+      const response = await api.getKnowledgeDocumentFile(
+        attachment.scope,
+        attachment.knowledge_filename,
+        attachment.scope === "session" ? effectiveChatThreadId : undefined,
+      );
+      if (!response.ok) {
+        addToast("error", "Preview unavailable", response.statusText || "Failed to load attachment.");
+        return;
+      }
+
+      const blob = await response.blob();
+      const lowerName = attachment.display_name.toLowerCase();
+      const downloadUrl = URL.createObjectURL(blob);
+
+      if (lowerName.endsWith(".pdf")) {
+        setKnowledgePreviewModal({
+          attachment,
+          downloadUrl,
+          isPdf: true,
+        });
+        return;
+      }
+
+      const isTextFile = TEXT_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
+      if (isTextFile) {
+        const content = await blob.text();
+        setKnowledgePreviewModal({
+          attachment,
+          content,
+          downloadUrl,
+          isPdf: false,
+        });
+        return;
+      }
+
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = attachment.display_name;
+      anchor.click();
+      URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      addToast("error", "Preview unavailable", error instanceof Error ? error.message : "Unknown error");
+    }
+  }, [addToast, effectiveChatThreadId]);
+
+  const renderFileNode = useCallback(
+    (node: FileNode) => {
+      const isDir = node.type === "directory";
+      const dirOpen = isDir && workspaceExpandedDirs.has(node.path);
+      return (
+        <TreeNode
+          key={node.path}
+          id={node.path}
+          label={
+            isDir ? (
+              <span
+                className="chat-landing-workspace-tree-name"
+                style={{
+                  fontSize: "0.8125rem",
+                  color: "var(--cds-text-primary)",
+                }}
+              >
+                {node.name}
+              </span>
+            ) : (
+              <span className="chat-landing-workspace-tree-row">
+                <span
+                  className="chat-landing-workspace-tree-filename"
+                  style={{
+                    cursor: "pointer",
+                    fontSize: "0.8125rem",
+                    color: "var(--cds-text-primary)",
+                  }}
+                  role="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleFileClick(node);
+                  }}
+                >
+                  {node.name}
+                </span>
+                <IconButton
+                  className="chat-landing-workspace-tree-download"
+                  label={`Download ${node.name}`}
+                  kind="ghost"
+                  size="sm"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void handleWorkspaceFileDownload(node);
+                  }}
+                >
+                  <Download size={14} />
+                </IconButton>
+              </span>
+            )
+          }
+          renderIcon={isDir ? (dirOpen ? FolderOpen : Folder) : DocumentBlank}
+          isExpanded={isDir ? dirOpen : false}
+          onToggle={isDir ? (first: unknown, second?: unknown) => handleWorkspaceDirToggle(node.path, first, second) : undefined}
+        >
+          {isDir && node.children?.map((child) => renderFileNode(child))}
+        </TreeNode>
+      );
+    },
+    [handleFileClick, handleWorkspaceDirToggle, handleWorkspaceFileDownload, workspaceExpandedDirs],
+  );
+
+  const handleToggleLeft = () => canShowLeft && setLeftOpen((v) => !v);
+  const handleToggleWorkspace = () => {
+    if (!canShowRight) return;
+    setRightSection("workspace");
+    setRightOpen(true);
+  };
+  const handleToggleKnowledge = () => {
+    if (!canShowRight) return;
+    setRightSection("knowledge");
+    setRightOpen(true);
+  };
+  const handleToggleConfiguration = () => {
+    if (!canShowRight) return;
+    setRightSection("configuration");
+    setRightOpen(true);
+  };
+  const handleToggleSkills = () => {
+    if (!canShowRight) return;
+    setRightSection("skills");
+    setRightOpen(true);
+  };
+  const activeKnowledgeThreadId = effectiveChatThreadId;
+  const sectionCounts: Record<RightPanelSection, number> = {
+    configuration: totalTools,
+    workspace: workspaceTree.length,
+    knowledge: knowledgeDocCount,
+    skills: skills.length,
+  };
+  const activeSectionMeta = RIGHT_PANEL_META[rightSection];
+  const ActiveSectionIcon = activeSectionMeta.icon;
+
+  return (
+    <div className="chat-landing">
+        <ConfigHeader
+          onToggleLeftSidebar={handleToggleLeft}
+          onToggleWorkspace={handleToggleWorkspace}
+        />
+
+      {/* ── Full-width chat — panels float on top ─────────────────────────── */}
+      <div className="chat-content-area" style={{ position: "relative", height: `calc(100vh - ${HEADER_HEIGHT}px)` }}>
+        <CarbonChat
+          contained={true}
+          threadId={effectiveChatThreadId}
+          attachmentScope="session"
+          knowledgeEnabled={knowledgeEnabled}
+          sessionKnowledgeEnabled={sessionKnowledgeEnabled}
+          isReadonly={selectedThreadId != null && selectedThreadId !== activeThreadId}
+          onThreadChange={handleThreadChange}
+          homescreen={homescreenConfig}
+          sessionDocsVersion={sessionDocsVersion}
+          onSessionDocsChanged={handleSessionDocsChanged}
+          onOpenKnowledge={handleToggleKnowledge}
+          onPreviewKnowledgeAttachment={handlePreviewKnowledgeAttachment}
+        />
+      </div>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          LEFT PANEL — fixed, transparent, slides over chat
+          ══════════════════════════════════════════════════════════════════════ */}
+      {canShowLeft && (
+        <div style={panelStyle("left", HEADER_HEIGHT, LEFT_W, leftOpen)}>
+          {/* Header */}
+          <div style={panelHeader}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.625rem" }}>
+                <Chat size={20} style={{ color: "var(--cds-interactive)", flexShrink: 0 }} />
+                <div>
+                  <p style={{ fontSize: "0.875rem", fontWeight: 600, margin: 0, color: "var(--cds-text-primary)" }}>
+                    Conversations
+                  </p>
+                  <p style={{ fontSize: "0.6875rem", color: "var(--cds-text-secondary)", margin: "0.2rem 0 0" }}>
+                    {loading ? "Loading…" : `${threads.length} thread${threads.length !== 1 ? "s" : ""}`}
+                  </p>
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: "0.25rem", alignItems: "center" }}>
+                <IconButton
+                  label="New conversation"
+                  kind="ghost"
+                  size="sm"
+                  onClick={async () => {
+                    if (!draftThread.hasSentFirstMessage) {
+                      await clearDraftSessionFiles(draftThread.threadId);
+                    }
+                    createAndActivateDraftThread();
+                  }}
+                >
+                  <Add />
+                </IconButton>
+                <IconButton
+                  label="Remove all"
+                  kind="ghost"
+                  size="sm"
+                  onClick={handleRemoveAll}
+                  disabled={threads.length === 0}
+                >
+                  <TrashCan />
+                </IconButton>
+                <IconButton label="Close panel" kind="ghost" size="sm" onClick={() => setLeftOpen(false)}>
+                  <SidePanelClose />
+                </IconButton>
+              </div>
+            </div>
+
+            {effectiveChatThreadId && (
+              <div style={{ marginTop: "0.5rem", display: "flex", alignItems: "center", gap: "0.375rem" }}>
+                <Time size={12} style={{ color: "var(--cds-text-secondary)" }} />
+                <code style={{ fontSize: "0.6rem", color: "var(--cds-text-secondary)", fontFamily: "monospace" }}>
+                  {effectiveChatThreadId}
+                </code>
+              </div>
+            )}
+          </div>
+
+          {/* Thread list */}
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            {loading ? (
+              <div style={{ padding: "1rem" }}>
+                <SkeletonText paragraph lineCount={5} />
+              </div>
+            ) : threads.length === 0 ? (
+              <div
+                style={{
+                  padding: "3rem 1rem",
+                  textAlign: "center",
+                  color: "var(--cds-text-secondary)",
+                  fontSize: "0.8125rem",
+                }}
+              >
+                <Chat size={32} style={{ opacity: 0.25, display: "block", margin: "0 auto 0.75rem" }} />
+                No conversations yet.
+                <br />
+                Start a new chat to begin.
+              </div>
+            ) : (
+              threads.map((thread) => {
+                const isActive = selectedThreadId === thread.thread_id;
+                return (
+                  <button
+                    key={thread.thread_id}
+                    onClick={() => handleSelectThread(thread.thread_id)}
+                    style={{
+                      display: "block",
+                      width: "100%",
+                      textAlign: "left",
+                      background: isActive ? "rgba(var(--cds-interactive-rgb, 15,98,254), 0.08)" : "transparent",
+                      border: "none",
+                      borderLeft: isActive ? "3px solid var(--cds-interactive)" : "3px solid transparent",
+                      borderBottom: "1px solid var(--cds-border-subtle-00)",
+                      padding: "0.75rem 1rem",
+                      cursor: "pointer",
+                      transition: "background 0.12s",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isActive) (e.currentTarget as HTMLButtonElement).style.background = "rgba(0,0,0,0.04)";
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isActive) (e.currentTarget as HTMLButtonElement).style.background = "transparent";
+                    }}
+                  >
+                    <p
+                      style={{
+                        margin: 0,
+                        fontSize: "0.8125rem",
+                        fontWeight: isActive ? 600 : 400,
+                        color: "var(--cds-text-primary)",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {thread.first_message || "Untitled conversation"}
+                    </p>
+                    <div style={{ marginTop: "0.25rem", display: "flex", alignItems: "center", gap: "0.375rem" }}>
+                      <Time size={10} style={{ color: "var(--cds-text-secondary)" }} />
+                      <span style={{ fontSize: "0.6875rem", color: "var(--cds-text-secondary)" }}>
+                        {formatTimestamp(thread.updated_at)}
+                      </span>
+                      {isActive && (
+                        <Tag type="blue" size="sm" style={{ marginLeft: "auto" }}>
+                          active
+                        </Tag>
+                      )}
+                    </div>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          RIGHT PANEL — fixed, transparent, slides over chat
+          ══════════════════════════════════════════════════════════════════════ */}
+      {canShowRight && (
+        <div style={panelStyle("right", HEADER_HEIGHT, RIGHT_W, rightOpen)}>
+          {/* Agent identity header */}
+          <div style={panelHeader}>
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: "0.625rem" }}>
+                <Application
+                  size={20}
+                  style={{ flexShrink: 0, marginTop: "0.125rem", color: "var(--cds-interactive)" }}
+                />
+                <div>
+                  <p style={{ fontSize: "0.875rem", fontWeight: 600, margin: 0, color: "var(--cds-text-primary)" }}>
+                    {agentConfig.name}
+                  </p>
+                  <p
+                    style={{
+                      fontSize: "0.6875rem",
+                      color: "var(--cds-text-secondary)",
+                      margin: "0.2rem 0 0",
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    {agentConfig.description}
+                  </p>
+                  {agentConfig.configVersion != null && (
+                    <div style={{ marginTop: "0.5rem", display: "flex", alignItems: "center", gap: "0.375rem" }}>
+                      <Tag type="gray" size="sm">
+                        Config v{agentConfig.configVersion}
+                      </Tag>
+                    </div>
+                  )}
+                </div>
+              </div>
+              <IconButton label="Close panel" kind="ghost" size="sm" onClick={() => setRightOpen(false)}>
+                <SidePanelClose />
+              </IconButton>
+            </div>
+          </div>
+
+          <div
+            className="agent-info-panel"
+            style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}
+          >
+            <div className="agent-section-switcher">
+              {(["configuration", "workspace", "knowledge", "skills"] as RightPanelSection[]).map((section) => {
+                const meta = RIGHT_PANEL_META[section];
+                const SectionIcon = meta.icon;
+                const handleClick =
+                  section === "configuration"
+                    ? handleToggleConfiguration
+                    : section === "workspace"
+                      ? handleToggleWorkspace
+                      : section === "knowledge"
+                        ? handleToggleKnowledge
+                        : handleToggleSkills;
+                const isActive = rightSection === section;
+                return (
+                  <button
+                    key={section}
+                    type="button"
+                    className={`agent-section-button ${isActive ? "active" : ""}`}
+                    onClick={handleClick}
+                    aria-label={meta.ariaLabel}
+                    title={meta.title}
+                    style={{ position: "relative" }}
+                  >
+                    <SectionIcon size={18} />
+                    <span className={`agent-section-badge ${meta.badgeClass}`}>{sectionCounts[section]}</span>
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        position: "absolute",
+                        left: 0,
+                        right: 0,
+                        bottom: -2,
+                        height: 3,
+                        backgroundColor: isActive ? "var(--cds-interactive, #0f62fe)" : "transparent",
+                        pointerEvents: "none",
+                        zIndex: 2,
+                      }}
+                    />
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="agent-section-content">
+              <div className="agent-section-header">
+                <div className="agent-section-header__icon">
+                  <ActiveSectionIcon size={18} />
+                </div>
+                <div className="agent-section-header__copy">
+                  <div className="agent-section-header__title-row">
+                    <h3>{activeSectionMeta.title}</h3>
+                    <Tag size="sm" type="gray">
+                      {sectionCounts[rightSection]}
+                    </Tag>
+                  </div>
+                  <p>{activeSectionMeta.subtitle}</p>
+                </div>
+              </div>
+
+              <Layer level={2} style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+                <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
+              {rightSection === "configuration" && (
+                <div style={{ padding: "1rem" }}>
+                  <Accordion>
+                    {agentConfig.apps.map((app) => (
+                      <AccordionItem
+                        key={app.appName}
+                        title={
+                          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", width: "100%" }}>
+                            <Application size={14} style={{ color: "var(--cds-interactive)", flexShrink: 0 }} />
+                            <span style={{ fontWeight: 600, color: "var(--cds-text-primary)", flex: 1 }}>
+                              {app.appName}
+                            </span>
+                            <Tag type="teal" size="sm">
+                              {app.tools.length} tool{app.tools.length !== 1 ? "s" : ""}
+                            </Tag>
+                          </div>
+                        }
+                      >
+                        <ContainedList>
+                          {app.tools.map((tool) => (
+                            <ContainedListItem
+                              key={tool.name}
+                              renderIcon={ChevronRight}
+                            >
+                              <div>
+                                <code
+                                  style={{
+                                    fontSize: "0.75rem",
+                                    fontWeight: 600,
+                                    color: "var(--cds-text-primary)",
+                                    display: "block",
+                                  }}
+                                >
+                                  {tool.name}
+                                </code>
+                                <span
+                                  style={{
+                                    fontSize: "0.6875rem",
+                                    color: "var(--cds-text-secondary)",
+                                    lineHeight: 1.4,
+                                    display: "block",
+                                    wordBreak: "break-word"
+                                  }}
+                                  title={tool.description}
+                                >
+                                  {truncateText(tool.description, 120)}
+                                </span>
+                              </div>
+                            </ContainedListItem>
+                          ))}
+                        </ContainedList>
+                      </AccordionItem>
+                    ))}
+                  </Accordion>
+                </div>
+              )}
+
+              {rightSection === "workspace" && (
+                <div
+                  className={`chat-landing-workspace-panel${workspaceDragOver ? " chat-landing-workspace-panel--drag-over" : ""}`}
+                  style={{ padding: "1rem", position: "relative", minHeight: "12rem" }}
+                  onDragEnter={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (e.dataTransfer?.types.includes("Files")) setWorkspaceDragOver(true);
+                  }}
+                  onDragLeave={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const { clientX: x, clientY: y } = e;
+                    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+                      setWorkspaceDragOver(false);
+                    }
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setWorkspaceDragOver(false);
+                    const files = filterJsonUploadFiles(Array.from(e.dataTransfer.files));
+                    if (files.length > 0) void handleWorkspaceUpload(files);
+                  }}
+                >
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.25rem", marginBottom: "0.75rem" }}>
+                  <input
+                    ref={workspaceFileInputRef}
+                    type="file"
+                    accept=".json,.jsonl,.ndjson"
+                    multiple
+                    style={{ display: "none" }}
+                    onChange={handleWorkspaceFileInputChange}
+                  />
+                  <IconButton
+                    label="Upload JSON files"
+                    kind="ghost"
+                    size="sm"
+                    onClick={() => workspaceFileInputRef.current?.click()}
+                  >
+                    <Upload size={16} />
+                  </IconButton>
+                  <IconButton
+                    label="Refresh workspace"
+                    kind="ghost"
+                    size="sm"
+                    onClick={() => void fetchWorkspaceTree(true)}
+                  >
+                    <Renew size={16} />
+                  </IconButton>
+                </div>
+                {workspaceTreeLoading ? (
+                  <div style={{ padding: "1rem" }}>
+                    <SkeletonText paragraph lineCount={5} />
+                  </div>
+                ) : workspaceTree.length === 0 ? (
+                  <div
+                    style={{
+                      padding: "2rem 1rem",
+                      textAlign: "center",
+                      color: "var(--cds-text-secondary)",
+                      fontSize: "0.8125rem",
+                    }}
+                  >
+                    <Folder size={32} style={{ opacity: 0.25, display: "block", margin: "0 auto 0.75rem" }} />
+                    No workspace files.
+                    <br />
+                    <span style={{ fontSize: "0.75rem" }}>
+                      Upload JSON files — they appear under workspace/uploads/
+                    </span>
+                  </div>
+                ) : (
+                  <TreeView label="Workspace" hideLabel className="chat-landing-workspace-tree">
+                    {workspaceTree.map((node) => renderFileNode(node))}
+                  </TreeView>
+                )}
+                {workspaceDragOver && (
+                  <div className="chat-landing-workspace-drag-overlay">
+                    Drop JSON files here to upload
+                  </div>
+                )}
+                </div>
+              )}
+
+              {rightSection === "knowledge" && (
+                <KnowledgeSidePanel
+                  inline={true}
+                  isOpen={true}
+                  onToggle={handleToggleWorkspace}
+                  threadId={activeKnowledgeThreadId}
+                  sessionDocsVersion={sessionDocsVersion}
+                  onSessionDocsChanged={() => {
+                    handleSessionDocsChanged();
+                    setRightSection("knowledge");
+                  }}
+                  onDocCountChanged={setKnowledgeDocCount}
+                  knowledgeEnabled={knowledgeEnabled}
+                  agentKnowledgeEnabled={agentKnowledgeEnabled}
+                  sessionKnowledgeEnabled={sessionKnowledgeEnabled}
+                  citationsEnabled={citationsEnabled}
+                  agentLabel={agentConfig.name}
+                />
+              )}
+
+              {rightSection === "skills" && (
+                <div style={{ padding: "1rem" }}>
+                {skillsLoading ? (
+                  <div style={{ padding: "1rem" }}>
+                    <SkeletonText paragraph lineCount={4} />
+                  </div>
+                ) : skills.length === 0 ? (
+                  <div
+                    style={{
+                      padding: "3rem 1rem",
+                      textAlign: "center",
+                      color: "var(--cds-text-secondary)",
+                      fontSize: "0.875rem",
+                    }}
+                  >
+                    <Application size={40} style={{ opacity: 0.3, display: "block", margin: "0 auto 1rem" }} />
+                    <p style={{ margin: 0 }}>No skills installed</p>
+                    <p style={{ margin: "0.5rem 0 0 0", fontSize: "0.75rem" }}>Skills will appear here once configured</p>
+                  </div>
+                ) : (
+                  <Stack gap={4}>
+                    {skills.map((skill) => {
+                      const isExpanded = expandedSkills.has(skill.name);
+                      const descLength = skill.description?.length || 0;
+                      const shouldTruncate = descLength > 100;
+                      const displayDesc = isExpanded || !shouldTruncate
+                        ? skill.description
+                        : truncateText(skill.description || "", 100);
+
+                      return (
+                        <Tile
+                          key={skill.name}
+                          style={{ padding: 0, overflow: "hidden", borderRadius: "4px" }}
+                        >
+                          {/* Header */}
+                          <div
+                            style={{
+                              background: "var(--cds-layer-02)",
+                              padding: "1rem",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: "0.75rem",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flex: 1, minWidth: 0 }}>
+                              <div
+                                style={{
+                                  width: "32px",
+                                  height: "32px",
+                                  borderRadius: "4px",
+                                  background: "var(--cds-interactive-01)",
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                <Application size={16} style={{ color: "white" }} />
+                              </div>
+                              <div style={{ minWidth: 0, flex: 1 }}>
+                                <h4
+                                  style={{
+                                    margin: "0 0 0.125rem 0",
+                                    fontSize: "0.875rem",
+                                    fontWeight: 600,
+                                    color: "var(--cds-text-primary)",
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  {skill.name}
+                                </h4>
+                              </div>
+                            </div>
+                            <Tag type="blue" size="sm" style={{ whiteSpace: "nowrap", flexShrink: 0 }}>
+                              {skill.source}
+                            </Tag>
+                          </div>
+
+                          {/* Content */}
+                          <div style={{ padding: "1rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                            <p
+                              style={{
+                                margin: 0,
+                                fontSize: "0.75rem",
+                                color: "var(--cds-text-secondary)",
+                                lineHeight: 1.6,
+                              }}
+                            >
+                              {displayDesc || "No description available"}
+                            </p>
+
+                            {shouldTruncate && (
+                              <Button
+                                kind="ghost"
+                                size="sm"
+                                onClick={() => {
+                                  setExpandedSkills((prev) => {
+                                    const next = new Set(prev);
+                                    if (isExpanded) {
+                                      next.delete(skill.name);
+                                    } else {
+                                      next.add(skill.name);
+                                    }
+                                    return next;
+                                  });
+                                }}
+                                style={{ justifyContent: "flex-start", paddingLeft: 0 }}
+                              >
+                                {isExpanded ? "Show less" : "Show more"}
+                              </Button>
+                            )}
+
+                            {skill.requirements && skill.requirements.length > 0 && (
+                              <div style={{ marginTop: "0.25rem" }}>
+                                <div
+                                  style={{
+                                    fontSize: "0.7rem",
+                                    fontWeight: 700,
+                                    color: "var(--cds-text-primary)",
+                                    textTransform: "uppercase",
+                                    letterSpacing: "0.5px",
+                                    marginBottom: "0.5rem",
+                                  }}
+                                >
+                                  Requirements
+                                </div>
+                                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+                                  {skill.requirements.map((req) => (
+                                    <Tag key={req} type="cool-gray" size="sm">
+                                      {req}
+                                    </Tag>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </Tile>
+                      );
+                    })}
+                  </Stack>
+                )}
+                </div>
+              )}
+                </div>
+              </Layer>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Floating re-open buttons when panels are closed ──────────────── */}
+      {canShowLeft && !leftOpen && (
+        <button
+          onClick={() => setLeftOpen(true)}
+          title="Open conversations"
+          style={{
+            position: "fixed",
+            top: HEADER_HEIGHT + 12,
+            left: 8,
+            zIndex: 201,
+            background: "rgba(var(--cds-background-rgb, 255,255,255), 0.7)",
+            backdropFilter: "blur(8px)",
+            border: "1px solid var(--cds-border-subtle-01)",
+            borderRadius: "4px",
+            padding: "6px",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            color: "var(--cds-text-primary)",
+          }}
+        >
+          <SidePanelOpen size={16} />
+        </button>
+      )}
+
+      {canShowRight && !rightOpen && (
+        <button
+          onClick={() => setRightOpen(true)}
+          title="Open agent panel"
+          style={{
+            position: "fixed",
+            top: HEADER_HEIGHT + 12,
+            right: 8,
+            zIndex: 201,
+            background: "rgba(var(--cds-background-rgb, 255,255,255), 0.7)",
+            backdropFilter: "blur(8px)",
+            border: "1px solid var(--cds-border-subtle-01)",
+            borderRadius: "4px",
+            padding: "6px",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            color: "var(--cds-text-primary)",
+          }}
+        >
+          <SidePanelOpen size={16} style={{ transform: "scaleX(-1)" }} />
+        </button>
+      )}
+
+      <ComposedModal
+        open={!!fileModal}
+        onClose={() => setFileModal(null)}
+        size="lg"
+        isFullWidth
+      >
+        <ModalHeader
+          title={fileModal?.name ?? ""}
+          buttonOnClick={() => setFileModal(null)}
+        />
+        <ModalBody hasScrollingContent className="chat-landing-file-modal-body">
+          {fileModal && (
+            <div className="chat-landing-file-modal-markdown">
+              <Markdown>
+                {fileModal.name.toLowerCase().endsWith(".md")
+                  ? fileModal.content
+                  : `\`\`\`\n${fileModal.content}\n\`\`\``}
+              </Markdown>
+            </div>
+          )}
+        </ModalBody>
+        {fileModal && (
+          <ModalFooter className="chat-landing-file-modal-footer">
+            <Button
+              kind="secondary"
+              renderIcon={Download}
+              onClick={async () => {
+                try {
+                  const res = await api.getWorkspaceDownload(fileModal.path, effectiveChatThreadId || undefined);
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = fileModal.name;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }
+                } catch (err) {
+                  addToast("error", "Download failed", err instanceof Error ? err.message : "Unknown error");
+                }
+              }}
+            >
+              Download
+            </Button>
+            <Button kind="primary" onClick={() => setFileModal(null)}>
+              Close
+            </Button>
+          </ModalFooter>
+        )}
+      </ComposedModal>
+
+      <ComposedModal
+        open={!!knowledgePreviewModal}
+        onClose={closeKnowledgePreviewModal}
+        size="lg"
+        isFullWidth
+      >
+        <ModalHeader
+          title={knowledgePreviewModal?.attachment.display_name ?? ""}
+          buttonOnClick={closeKnowledgePreviewModal}
+        />
+        <ModalBody hasScrollingContent className="chat-landing-file-modal-body">
+          {knowledgePreviewModal && (
+            knowledgePreviewModal.isPdf ? (
+              <iframe
+                title={knowledgePreviewModal.attachment.display_name}
+                src={knowledgePreviewModal.downloadUrl}
+                style={{ width: "100%", minHeight: "70vh", border: "none" }}
+              />
+            ) : (
+              <div className="chat-landing-file-modal-markdown">
+                <Markdown>
+                  {knowledgePreviewModal.attachment.display_name.toLowerCase().endsWith(".md")
+                    ? knowledgePreviewModal.content ?? ""
+                    : `\`\`\`\n${knowledgePreviewModal.content ?? ""}\n\`\`\``}
+                </Markdown>
+              </div>
+            )
+          )}
+        </ModalBody>
+        {knowledgePreviewModal && (
+          <ModalFooter className="chat-landing-file-modal-footer">
+            <Button
+              kind="secondary"
+              renderIcon={Download}
+              onClick={() => {
+                const anchor = document.createElement("a");
+                anchor.href = knowledgePreviewModal.downloadUrl;
+                anchor.download = knowledgePreviewModal.attachment.display_name;
+                anchor.click();
+              }}
+            >
+              Download
+            </Button>
+            <Button kind="primary" onClick={closeKnowledgePreviewModal}>
+              Close
+            </Button>
+          </ModalFooter>
+        )}
+      </ComposedModal>
+
+      {/* Toast Notifications */}
+      <div
+        style={{
+          position: "fixed",
+          top: "3rem",
+          right: "1rem",
+          zIndex: 9999,
+          display: "flex",
+          flexDirection: "column",
+          gap: "0.5rem",
+          maxWidth: "400px",
+        }}
+      >
+        {toastNotifications.map((toast) => (
+          <ToastNotification
+            key={toast.id}
+            kind={toast.kind}
+            title={toast.title}
+            subtitle={toast.subtitle}
+            timeout={5000}
+            onClose={() => removeToast(toast.id)}
+            lowContrast
+          />
+        ))}
+      </div>
+    </div>
+  );
+}

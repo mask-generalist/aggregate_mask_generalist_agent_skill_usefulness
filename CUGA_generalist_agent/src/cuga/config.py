@@ -1,0 +1,421 @@
+import os
+
+# stdlib
+from importlib import import_module
+from pathlib import Path
+from sys import platform
+from urllib.parse import urlparse
+
+# third-party imports
+import dynaconf
+from dotenv import find_dotenv, load_dotenv
+from dynaconf import Dynaconf, Validator
+from loguru import logger
+
+# Default HTTP timeout for OpenAI/Azure/OpenRouter LLM clients (seconds).
+# One second above common 60s gateway limits so the client fails cleanly first.
+DEFAULT_LLM_HTTP_TIMEOUT = 61
+
+# ---------------------------------------------------------------------------
+# Package root & path helper (must be defined BEFORE first use)
+# ---------------------------------------------------------------------------
+
+# Get the package root from path_store
+PACKAGE_ROOT = Path(os.environ.get("CUGA_PACKAGE_ROOT", Path(__file__).parent.resolve()))
+DEMO_TOOLS_ROOT = (PACKAGE_ROOT / "demo_tools").resolve()
+REPO_ROOT = PACKAGE_ROOT.parent.parent.resolve()
+LOGGING_DIR = os.environ.get("CUGA_LOGGING_DIR", os.path.join(PACKAGE_ROOT, "./logging"))
+TRAJECTORY_DATA_DIR = os.path.join(LOGGING_DIR, "trajectory_data")
+TRACES_DIR = os.path.join(LOGGING_DIR, "traces")
+# Databases directory (sibling to logging)
+DBS_DIR = os.environ.get("CUGA_DBS_DIR", os.path.join(PACKAGE_ROOT, "./dbs"))
+# Define all path variables at the top (with environment variable overrides)
+ENV_FILE_PATH = os.getenv("ENV_FILE_PATH") or os.path.join(PACKAGE_ROOT, "..", "..", ".env")
+
+# Embedding-model cache. Without this, fastembed falls back to
+# ``tempfile.gettempdir()/fastembed_cache`` — on macOS that is /var/folders/...,
+# which the OS periodically purges, silently deleting hundreds of MB of ONNX
+# models. The next start then re-downloads them, and if that download is
+# interrupted it leaves a dangling snapshot symlink that hard-fails with
+# NoSuchFile on EVERY subsequent start (see _FastEmbedEmbeddings' self-heal).
+# Container images already pin this via Dockerfile.ubi; this gives local
+# installs the same durability.
+#
+# Deliberately NOT under PACKAGE_ROOT (where dbs/ and logging/ live): for a
+# pip-installed CUGA that is site-packages, which is the wrong home for large
+# model blobs and may be read-only.
+FASTEMBED_CACHE_DIR = os.environ.get(
+    "FASTEMBED_CACHE_PATH", os.path.join(os.path.expanduser("~"), ".cache", "cuga", "fastembed")
+)
+os.environ.setdefault("FASTEMBED_CACHE_PATH", FASTEMBED_CACHE_DIR)
+
+
+# Helper function to find config files with existence check
+def _find_config_file(filename: str, env_var_name: str) -> str:
+    """Find config file, checking existence in getcwd first, then package root."""
+    # First check environment variable
+    env_path = os.getenv(env_var_name)
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    # Check in current working directory
+    cwd_path = os.path.join(os.getcwd(), filename)
+    if os.path.exists(cwd_path):
+        return cwd_path
+
+    # Fall back to package root
+    package_path = os.path.join(PACKAGE_ROOT, filename)
+    return package_path  # Return even if it doesn't exist for consistency
+
+
+SETTINGS_TOML_PATH = _find_config_file("settings.toml", "SETTINGS_TOML_PATH")
+CONFIGURATIONS_DIR = os.environ.get("CUGA_CONFIGURATIONS_DIR", os.path.join(PACKAGE_ROOT, "configurations"))
+MODELS_DIR = os.path.join(CONFIGURATIONS_DIR, "models")
+MODES_DIR = os.path.join(CONFIGURATIONS_DIR, "modes")
+# from feature_flags import FeatureFlags as flags
+
+# 1) Let users (or CI) force a path when needed
+if os.getenv("ENV_FILE"):
+    load_dotenv(os.getenv("ENV_FILE"), override=True)
+else:
+    # 2) Try to find it when working from a git clone (searches up from CWD)
+    path = find_dotenv(filename=".env", usecwd=True)
+    if not path:
+        # 3) Try again when your code is used as an installed package
+        #    (searches up from the module’s location)
+        path = find_dotenv(filename=".env", usecwd=False)
+
+    load_dotenv(path, override=False)
+
+for key, value in os.environ.items():
+    if key.startswith("WA_"):
+        new_key = key[3:]
+        os.environ[new_key] = value
+
+app_mapping = {
+    urlparse(os.getenv("WA_REDDIT")).netloc: "reddit",
+    urlparse(os.getenv("WA_SHOPPING")).netloc: "shopping",
+    urlparse(os.getenv("WA_SHOPPING_ADMIN")).netloc: "shopping_admin",
+    urlparse(os.getenv("WA_GITLAB")).netloc: "gitlab",
+    urlparse(os.getenv("WA_WIKIPEDIA")).netloc: "wikipedia",
+    urlparse(os.getenv("WA_MAP")).netloc: "map",
+    urlparse(os.getenv("WA_HOMEPAGE")).netloc: "homepage",
+}
+
+
+# Load your settings
+
+
+def get_all_paths(config, parent_key=""):
+    """
+    Recursively traverse a nested dictionary and generate all paths with keys separated by dots.
+
+    Args:
+        nested_dict (dict): The nested dictionary to traverse.
+        parent_key (str): The accumulated path of keys (used during recursion).
+
+    Returns:
+        list: A list of all paths as strings.
+    """
+    paths = []
+    for key, value in config.items():
+        current_path = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+            paths.extend(get_all_paths(value, current_path))
+        else:
+            paths.append(current_path)
+    return paths
+
+
+# Use PACKAGE_ROOT for all file paths to ensure they work regardless of where the app is started
+validators = [
+    Validator("eval_config.headless", default=False),
+    Validator("features.local_sandbox", default=True),
+    Validator("features.forced_apps", default=None),
+    Validator("features.thoughts", default=True),
+    Validator("features.code_generation", default="accurate"),
+    Validator("advanced_features.registry", default=True),
+    Validator("features.task_decomposition", default=False),
+    Validator("advanced_features.langfuse_tracing", default=False),
+    Validator("observability.openlit", default=False),
+    Validator("observability.pricing_json", default=""),
+    Validator("observability.litellm_local_model_cost_map", default=True),
+    Validator("advanced_features.benchmark", default="default"),
+    Validator("advanced_features.appworld_final_answer_plain", default=False),
+    Validator("advanced_features.tracker_enabled", default=False),
+    Validator("advanced_features.lite_mode", default=False),
+    Validator("advanced_features.lite_mode_tool_threshold", default=15),
+    Validator("advanced_features.decomposition_strategy", default="flexible"),
+    Validator("advanced_features.local_sandbox", default=True),
+    Validator("advanced_features.message_window_limit", default=20),
+    Validator("advanced_features.max_input_length", default=50000),
+    Validator("advanced_features.e2b_sandbox_mode", default="per-session"),
+    Validator("advanced_features.e2b_sandbox_idle_ttl", default=600),
+    Validator("advanced_features.e2b_sandbox_max_age", default=86400),
+    Validator("advanced_features.e2b_sandbox_ttl_buffer", default=60),
+    Validator("advanced_features.e2b_cleanup_on_create", default=True),
+    Validator("advanced_features.e2b_cleanup_frequency", default=0),
+    Validator("advanced_features.enable_web_search", default=False),
+    Validator("advanced_features.execution_output_max_length", default=35000),
+    Validator("advanced_features.enable_shell_tool", default=False),
+    Validator("advanced_features.enable_filesystem_tools", default=False),
+    Validator("advanced_features.sandbox_mode", default="opensandbox"),
+    Validator("advanced_features.cuga_lite_nl_auto_continue", default=True),
+    Validator("advanced_features.cuga_lite_warn_suspect_args", default=True),
+    Validator("features.chat", default=True),
+    Validator("playwright_args", default=[]),
+    Validator("server_ports.registry_host", default=None),
+    Validator("server_ports.demo_server_startup_max_retries", default=360),
+    Validator("storage.mode", default="local"),
+    Validator("storage.local_db_path", default=""),
+    Validator("storage.postgres_url", default=""),
+    Validator("storage.preserve_configs_on_startup", default="prod"),
+    Validator("service.instance_id", default=""),
+    Validator("service.tenant_id", default=""),
+    Validator("secrets.mode", default="local"),
+    Validator("secrets.force_env", default=False),
+    Validator("secrets.db_encryption_key_env", default="CUGA_SECRET_KEY"),
+    Validator("secrets.vault_addr", default=""),
+    Validator("secrets.vault_token_env", default="VAULT_TOKEN"),
+    Validator("secrets.vault_auth_method", default=""),
+    Validator("secrets.vault_k8s_role", default=""),
+    Validator("secrets.vault_k8s_mount_path", default="kubernetes"),
+    Validator("secrets.vault_k8s_jwt_path", default="/var/run/secrets/kubernetes.io/serviceaccount/token"),
+    Validator("secrets.vault_cacert", default=""),
+    Validator("secrets.vault_skip_verify", default=False),
+    Validator("secrets.vault_mount", default="secret"),
+    Validator("secrets.vault_kv_version", default=""),
+    Validator("secrets.vault_secret_path", default=""),
+    Validator("secrets.vault_write_enabled", default=False),
+    Validator("secrets.aws_region", default=""),
+    Validator("auth.enabled", default=False),
+    Validator("auth.authorization_enabled", default=False),
+    Validator("auth.manage_roles", default=["ServiceOwner", "ServiceAdmin"]),
+    Validator("auth.chat_roles", default=["ServiceOwner", "ServiceAdmin", "ServiceUser"]),
+    Validator("auth.session_cookie_name", default="cuga_session"),
+    Validator("auth.session_max_age", default=3600),
+    Validator("auth.jwks_cache_ttl", default=3600),
+    Validator("auth.require_https", default=False),
+    Validator("auth.ssl_keyfile", default=""),
+    Validator("auth.ssl_certfile", default=""),
+    Validator("auth.oidc_skip_verify", default=False),
+    Validator("auth.oidc_ca_bundle", default=""),
+    Validator("auth.iam_proxy_url", default=""),
+    Validator("auth.iam_proxy_skip_verify", default=False),
+    Validator("auth.iam_proxy_ca_bundle", default=""),
+    Validator("auth.role_token_source", default="auto"),
+    Validator("skills.enabled", default=False),
+    Validator("skills.root", default="cuga", is_in=["cuga", "agents", "global_agents", "global_cuga"]),
+    # Phase 6: explicit execution axes — override advanced_features when set.
+    # None (default) means "read from advanced_features" (full backward-compat).
+    Validator("execution.python_backend", default=None),
+    Validator("execution.shell_backend", default=None),
+    Validator("execution.filesystem_backend", default=None),
+    Validator("execution.workspace_root", default=None),
+    Validator("advanced_features.builtin_tools", default=["knowledge"]),
+    Validator("advanced_features.cuga_lite_bind_tools_tool_names", default=[]),
+    Validator("advanced_features.cuga_lite_bind_tools_max_count", default=128),
+    Validator("advanced_features.cuga_lite_bind_tools_pad_to_cap", default=False),
+    # Evolve integration
+    Validator("evolve.enabled", default=False),
+    Validator("evolve.url", default="http://127.0.0.1:8201/sse"),
+    Validator("evolve.mode", default="auto"),
+    Validator("evolve.app_name", default="evolve"),
+    Validator("evolve.lite_mode_only", default=True),
+    Validator("evolve.save_on_success", default=True),
+    Validator("evolve.save_on_failure", default=True),
+    Validator("evolve.async_save", default=True),
+    Validator("evolve.timeout", default=30.0),
+    Validator("connections.llm_http_timeout", default=DEFAULT_LLM_HTTP_TIMEOUT),
+    # Agent spawning
+    Validator("agent_spawn.enabled", default=False),
+    Validator("agent_spawn.max_spawn_depth", default=2, is_type_of=int, gt=0),
+    Validator("agent_spawn.forward_sync_subagent_events", default=True),
+    Validator(
+        "advanced_features.sandbox_execution_timeout",
+        default=30,
+        is_type_of=int,
+        gt=0,
+    ),
+]
+
+EVAL_CONFIG_TOML_PATH = _find_config_file("eval_config.toml", "EVAL_CONFIG_TOML_PATH")
+
+base_settings = Dynaconf(
+    root_path=PACKAGE_ROOT,
+    settings_files=[
+        SETTINGS_TOML_PATH,
+        ENV_FILE_PATH,
+        EVAL_CONFIG_TOML_PATH,
+    ],
+    validators=validators,
+)
+logger.info("Running cuga in *{}* mode".format(base_settings.features.cuga_mode))
+if base_settings.advanced_features.tracker_enabled:
+    logger.info("✅ tracker enabled - logs and trajectory data will be saved")
+else:
+    logger.warning("tracker disabled - logs and trajectory data will not be saved")
+
+# Auto-override sandbox_mode: "native" requires macOS (sandbox-exec); fall back to "local" elsewhere.
+# Does not override if the user has already explicitly set a non-"native" mode via env var.
+_configured_sandbox_mode = getattr(
+    getattr(base_settings, "advanced_features", None), "sandbox_mode", "opensandbox"
+)
+if _configured_sandbox_mode == "native" and platform != "darwin":
+    logger.info(
+        f"sandbox_mode='native' requires macOS; current platform is {platform!r}. "
+        "Falling back to sandbox_mode='local'."
+    )
+    os.environ["DYNACONF_ADVANCED_FEATURES__SANDBOX_MODE"] = "local"
+
+# Read and sanitize the model settings filename (Windows users sometimes include quotes)
+default_llm = os.environ.get("AGENT_SETTING_CONFIG", "settings.openai.toml")
+# Remove inline comments (everything after #) and strip quotes/whitespace
+default_llm = default_llm.split('#')[0].strip().strip('"').strip("'").strip()
+# Fall back to default if the env var was set but empty (e.g. missing GitHub secret)
+if not default_llm:
+    default_llm = "settings.openai.toml"
+logger.info("loaded llm settings *{}*".format(default_llm))
+
+# Resolve absolute config file paths
+models_file_path = os.path.join(MODELS_DIR, default_llm)
+modes_file_path = os.path.join(MODES_DIR, f"{base_settings.features.cuga_mode}.toml")
+
+logger.info(f"Models config path: {models_file_path}")
+logger.info(f"Mode config path:   {modes_file_path}")
+
+# Knowledge configuration
+KNOWLEDGE_DIR = os.path.join(CONFIGURATIONS_DIR, "knowledge")
+knowledge_file_path = os.path.join(KNOWLEDGE_DIR, "knowledge_settings.toml")
+
+# Fail fast with clear error if files are missing (helps especially on Windows)
+if os.getenv("CUGA_STRICT_CONFIG", "1") == "1":
+    if not os.path.isfile(models_file_path):
+        raise FileNotFoundError(
+            "Could not find models configuration file: "
+            f"{models_file_path}. If you are on Windows and set AGENT_SETTING_CONFIG in CMD, "
+            "do not include surrounding quotes."
+        )
+    if not os.path.isfile(modes_file_path):
+        raise FileNotFoundError(f"Could not find mode configuration file: {modes_file_path}.")
+
+settings_files = [
+    SETTINGS_TOML_PATH,
+    ENV_FILE_PATH,
+    EVAL_CONFIG_TOML_PATH,
+    models_file_path,
+    modes_file_path,
+    knowledge_file_path,
+]
+
+settings = Dynaconf(
+    root_path=PACKAGE_ROOT,
+    settings_files=settings_files,
+    validators=validators,
+)
+
+# Add default enable format in each model configuration
+paths = get_all_paths(settings, "")
+platform_paths = [k for k in paths if "model.platform" in k]
+for k in platform_paths:
+    settings.validators.register(
+        Validator(
+            k.lower().replace("platform", "enable_format"),
+            default=True
+            if "watsonx" in getattr(settings, k.lower())
+            or "rits" in getattr(settings, k.lower())
+            or "groq" in getattr(settings, k.lower())
+            else False,
+        )
+    )
+
+# raises after all possible errors are evaluated
+try:
+    settings.validators.validate_all()
+except dynaconf.ValidationError as e:
+    accumulative_errors = e.details
+    logger.warning(accumulative_errors)
+
+
+def apply_litellm_local_model_cost_map(enabled: bool) -> None:
+    """
+    Bridge Dynaconf observability.litellm_local_model_cost_map to LiteLLM's native env.
+
+    LiteLLM only treats LITELLM_LOCAL_MODEL_COST_MAP as local when its value.lower()
+    == "true". Settings win over any pre-existing native env value.
+    Override via DYNACONF_OBSERVABILITY__LITELLM_LOCAL_MODEL_COST_MAP.
+    """
+    if enabled:
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    else:
+        os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+
+
+# Apply at config load so `import litellm` later sees the offline flag.
+try:
+    apply_litellm_local_model_cost_map(
+        bool(getattr(getattr(settings, "observability", None), "litellm_local_model_cost_map", True))
+    )
+except Exception:
+    pass
+
+
+def get_class(class_path):
+    """Dynamically import and return a class by its full path."""
+    module_name, class_name = class_path.rsplit(".", 1)
+    module = import_module(module_name)
+    return getattr(module, class_name)
+
+
+# `envvar_prefix` = export envvars with `export DYNACONF_FOO=bar`.
+# `settings_files` = Load these files in the order.
+def get_user_data_path():
+    if platform == "darwin":  # macOS
+        return os.path.expanduser(os.getenv("MAC_USER_DATA_PATH", ""))
+    elif platform == "win32":  # Windows
+        return os.getenv("WINDOWS_USER_DATA_PATH", "")
+    elif platform.startswith("linux"):  # Linux/Unix systems
+        return os.path.expanduser(os.getenv("LINUX_USER_DATA_PATH", ""))
+    else:
+        raise Exception("Unsupported OS")
+
+
+def get_app_name_from_url(curr_url):
+    if not curr_url:
+        return "N/A"
+    parsed_url = urlparse(curr_url)
+    host_with_port = f"{parsed_url.hostname}:{parsed_url.port}"
+    return app_mapping.get(host_with_port, parsed_url.hostname)
+
+
+def get_service_instance_id() -> str:
+    """Service instance ID for multi-tenant/prod DB scoping. Set via DYNACONF_SERVICE__INSTANCE_ID."""
+    val = os.environ.get("DYNACONF_SERVICE__INSTANCE_ID")
+    if val is not None:
+        return str(val)
+    return str(getattr(getattr(settings, "service", None), "instance_id", "") or "")
+
+
+def get_tenant_id() -> str:
+    """Tenant ID for multi-tenant SaaS DB scoping. Set via DYNACONF_SERVICE__TENANT_ID."""
+    val = os.environ.get("DYNACONF_SERVICE__TENANT_ID")
+    if val is not None:
+        return str(val)
+    return str(getattr(getattr(settings, "service", None), "tenant_id", "") or "")
+
+
+def resolved_benchmark() -> str:
+    """Benchmark profile (e.g. ``appworld``, ``default``).
+
+    Prefer ``DYNACONF_ADVANCED_FEATURES__BENCHMARK`` from the process environment so
+    values set in the shell or via ``os.environ`` after ``cuga.config`` is imported
+    still apply; then fall back to :attr:`settings.advanced_features.benchmark`.
+    """
+    val = os.environ.get("DYNACONF_ADVANCED_FEATURES__BENCHMARK")
+    if val is not None and str(val).strip():
+        return str(val).strip()
+    return str(getattr(getattr(settings, "advanced_features", None), "benchmark", None) or "default")
+
+
+if __name__ == "__main__":
+    model = settings.agent.task_decomposition.model

@@ -1,0 +1,103 @@
+name: Stability Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stability-tests:
+    name: Stability Tests (Python ${{ matrix.python-version }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+    env:
+      AGENT_SETTING_CONFIG: ${{ vars.AGENT_SETTING_CONFIG }}
+      WATSONX_APIKEY: ${{ secrets.WATSONX_APIKEY }}
+      WATSONX_PROJECT_ID: ${{ vars.WATSONX_PROJECT_ID }}
+      WATSONX_URL: ${{ vars.WATSONX_URL }}
+      MODEL_NAME: ${{ secrets.MODEL_NAME }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      PYTHONIOENCODING: utf-8
+      CUGA_THREAD_WORKSPACE_SEED: crm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install uv and set the Python version
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Install Playwright browsers
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run stability tests
+        run: uv run pytest -m stability --stability-threshold 88 -n0
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-python-${{ matrix.python-version }}
+          path: src/system_tests/e2e/logs/
+          retention-days: 7
+
+  stability-tests-windows:
+    name: Stability Tests Windows Smoke (Python 3.12)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      AGENT_SETTING_CONFIG: ${{ vars.AGENT_SETTING_CONFIG }}
+      WATSONX_APIKEY: ${{ secrets.WATSONX_APIKEY }}
+      WATSONX_PROJECT_ID: ${{ vars.WATSONX_PROJECT_ID }}
+      WATSONX_URL: ${{ vars.WATSONX_URL }}
+      MODEL_NAME: ${{ secrets.MODEL_NAME }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      UV_NO_PROGRESS: 1
+      UV_QUIET: 1
+      PYTHONIOENCODING: utf-8
+      CUGA_THREAD_WORKSPACE_SEED: crm
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install uv and set the Python version
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run Windows smoke stability tests
+        run: uv run pytest -m windows_smoke --stability-threshold 88 -n0
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-python-3.12-windows
+          path: src/system_tests/e2e/logs/
+          retention-days: 7

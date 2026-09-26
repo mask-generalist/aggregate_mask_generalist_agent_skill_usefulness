@@ -8,7 +8,7 @@ We use and built on top of the following open-source libraries:
    - code: https://github.com/cuga-project/cuga-agent
    - paper: https://ojs.aaai.org/index.php/AAAI/article/view/41485
 2. **Pi-agent**
-   - code: https://pi.dev/
+   - code: https://github.com/earendil-works/pi
 3. **Tau2bench agent**
    - code: https://github.com/sierra-research/tau2-bench
    - paper: https://arxiv.org/pdf/2506.07982
